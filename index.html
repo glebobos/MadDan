@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Mad Daniil – SZCZECIN Blaster</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d0d1a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Courier New', monospace;
+    color: #fff;
+    overflow: hidden;
+    cursor: crosshair;
+  }
+  #hud {
+    display: flex;
+    gap: 40px;
+    margin-bottom: 10px;
+    font-size: 18px;
+    letter-spacing: 2px;
+    text-shadow: 0 0 8px #44aaff;
+  }
+  #hud span { color: #aaddff; }
+  #hud .val { color: #fff; font-weight: bold; }
+  canvas { display: block; border: 2px solid #334; box-shadow: 0 0 40px #1a2a4a; cursor: crosshair; }
+  #controls {
+    margin-top: 10px;
+    font-size: 12px;
+    color: #556;
+    letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span>SCORE: <span class="val" id="score">0</span></span>
+  <span>WAVE: <span class="val" id="wave">1</span></span>
+  <span>HP: <span class="val" id="hp">100</span></span>
+  <span>KILLS: <span class="val" id="kills">0</span></span>
+</div>
+<canvas id="c"></canvas>
+<div id="controls">СТРЕЛКИ / WASD – движение &nbsp;|&nbsp; МЫШЬ – прицел &nbsp;|&nbsp; ЛКМ / SPACE – огонь &nbsp;|&nbsp; R – рестарт</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+canvas.width  = 960;
+canvas.height = 680;
+const W = canvas.width, H = canvas.height;
+
+const elScore = document.getElementById('score');
+const elWave  = document.getElementById('wave');
+const elHp    = document.getElementById('hp');
+const elKills = document.getElementById('kills');
+
+// SZCZECIN sign – центральное непробиваемое препятствие
+const SIGN = { x: W/2 - 140, y: H/2 - 38, w: 280, h: 76 };
+// 4 угла для обхода монстрами (с отступом)
+const PAD = 22;
+const CORNERS = [
+  { x: SIGN.x - PAD,          y: SIGN.y - PAD },
+  { x: SIGN.x + SIGN.w + PAD, y: SIGN.y - PAD },
+  { x: SIGN.x - PAD,          y: SIGN.y + SIGN.h + PAD },
+  { x: SIGN.x + SIGN.w + PAD, y: SIGN.y + SIGN.h + PAD },
+];
+
+// Мышь
+const mouse = { x: W/2, y: H/2, down: false };
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+});
+canvas.addEventListener('mousedown', e => { if (e.button === 0) mouse.down = true; });
+canvas.addEventListener('mouseup',   e => { if (e.button === 0) mouse.down = false; });
+
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  if (e.code === 'KeyR' && gameOver) init();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ── Состояние ─────────────────────────────────────────────────────────────
+const PLAYER_SPEED = 3.2;
+let player, bullets, monsters, particles, casings;
+let score, kills, waveNum, spawnTimer, spawnInterval, gameOver, flashTimer;
+
+function init() {
+  player = {
+    x: 120, y: H/2,
+    r: 18,
+    moveAngle: 0,   // куда идёт
+    aimAngle: 0,    // куда смотрит/стреляет (по мыши)
+    hp: 100, maxHp: 100,
+    shootCd: 0, shootDelay: 12,
+    invincible: 0,
+    walkCycle: 0,
+  };
+  bullets   = [];
+  monsters  = [];
+  particles = [];
+  casings   = [];
+  score = 0; kills = 0; waveNum = 1;
+  spawnTimer = 0; spawnInterval = 120;
+  gameOver = false; flashTimer = 0;
+  updateHUD();
+}
+
+function updateHUD() {
+  elScore.textContent = score;
+  elWave.textContent  = waveNum;
+  elHp.textContent    = Math.max(0, Math.ceil(player.hp));
+  elKills.textContent = kills;
+}
+
+// ── Коллизии ──────────────────────────────────────────────────────────────
+function circleRect(cx, cy, cr, rx, ry, rw, rh) {
+  const nx = Math.max(rx, Math.min(cx, rx+rw));
+  const ny = Math.max(ry, Math.min(cy, ry+rh));
+  const dx = cx-nx, dy = cy-ny;
+  return dx*dx+dy*dy < cr*cr;
+}
+function circleCircle(ax, ay, ar, bx, by, br) {
+  const dx=ax-bx, dy=ay-by, d=ar+br;
+  return dx*dx+dy*dy < d*d;
+}
+// Пересекает ли отрезок (ax,ay)→(bx,by) прямоугольник SIGN?
+function segmentHitsSign(ax, ay, bx, by) {
+  const sx=SIGN.x, sy=SIGN.y, sw=SIGN.w, sh=SIGN.h;
+  // AABB vs segment через параметрическое деление
+  let tmin=0, tmax=1;
+  const dx=bx-ax, dy=by-ay;
+  const checks=[
+    [dx, sx-ax, sx+sw-ax],
+    [-dx, ax-sx-sw, ax-sx],
+    [dy, sy-ay, sy+sh-ay],
+    [-dy, ay-sy-sh, ay-sy],
+  ];
+  for (const [d,near,far] of checks) {
+    if (Math.abs(d)<1e-9) { if (near>0||far<0) return false; continue; }
+    const t1=near/d, t2=far/d;
+    tmin=Math.max(tmin,Math.min(t1,t2));
+    tmax=Math.min(tmax,Math.max(t1,t2));
+    if (tmin>tmax) return false;
+  }
+  return true;
+}
+
+// ── Стрельба ──────────────────────────────────────────────────────────────
+function shoot() {
+  if (player.shootCd > 0) return;
+  player.shootCd = player.shootDelay;
+
+  const a = player.aimAngle;
+  const cos = Math.cos(a), sin = Math.sin(a);
+  const px = -sin, py = cos; // перпендикуляр
+
+  const offsets = [
+    { d: -8, color: '#66ccff', glow: '#1166ff' },
+    { d:  8, color: '#ffcc44', glow: '#ff6600' },
+  ];
+  offsets.forEach(o => {
+    const ox = player.x + cos*22 + px*o.d;
+    const oy = player.y + sin*22 + py*o.d;
+    bullets.push({ x:ox, y:oy, vx:cos*10, vy:sin*10, life:65, color:o.color, glow:o.glow });
+    for (let i=0; i<5; i++) {
+      const ra = a+(Math.random()-.5)*.7;
+      addParticle(ox,oy, Math.cos(ra)*(3+Math.random()*4), Math.sin(ra)*(3+Math.random()*4),
+        8+Math.random()*8, o.color, 2+Math.random()*3);
+    }
+    casings.push({
+      x:ox, y:oy,
+      vx: -cos*2 + px*(o.d>0?3:-3)+(Math.random()-.5),
+      vy: -sin*2 + py*(o.d>0?3:-3)+(Math.random()-.5),
+      angle: Math.random()*Math.PI*2, spin:(Math.random()-.5)*.4,
+      life:50+Math.random()*30, alpha:1,
+    });
+  });
+}
+
+// ── Частицы ───────────────────────────────────────────────────────────────
+function addParticle(x,y,vx,vy,life,color,size=3) {
+  particles.push({x,y,vx,vy,life,maxLife:life,color,size});
+}
+function addFoam(x,y,count=12) {
+  // Пена от разбитой кружки
+  for (let i=0;i<count;i++) {
+    const a=Math.random()*Math.PI*2, s=1+Math.random()*5;
+    addParticle(x,y, Math.cos(a)*s, Math.sin(a)*s, 25+Math.random()*20, '#f5e642', 3+Math.random()*5);
+  }
+  for (let i=0;i<6;i++) {
+    const a=Math.random()*Math.PI*2, s=.5+Math.random()*3;
+    addParticle(x,y, Math.cos(a)*s, Math.sin(a)*s, 20+Math.random()*15, '#fffbe8', 4+Math.random()*6);
+  }
+}
+function addHitSplash(x,y) {
+  for (let i=0;i<5;i++) {
+    const a=Math.random()*Math.PI*2, s=1+Math.random()*3;
+    addParticle(x,y, Math.cos(a)*s, Math.sin(a)*s, 10+Math.random()*12, '#d4a800', 2+Math.random()*3);
+  }
+}
+function signSpark(x,y,color) {
+  for (let i=0;i<6;i++) {
+    const a=Math.random()*Math.PI*2, s=1+Math.random()*4;
+    addParticle(x,y, Math.cos(a)*s, Math.sin(a)*s, 12+Math.random()*12, color, 2+Math.random()*3);
+  }
+}
+
+// ── Спавн монстров ────────────────────────────────────────────────────────
+function spawnMonster() {
+  const edge = Math.floor(Math.random()*4);
+  const pad = 18;
+  let x, y;
+  if      (edge===0) { x=SIGN.x+Math.random()*SIGN.w; y=SIGN.y-pad; }
+  else if (edge===1) { x=SIGN.x+Math.random()*SIGN.w; y=SIGN.y+SIGN.h+pad; }
+  else if (edge===2) { x=SIGN.x-pad;                  y=SIGN.y+Math.random()*SIGN.h; }
+  else               { x=SIGN.x+SIGN.w+pad;           y=SIGN.y+Math.random()*SIGN.h; }
+
+  const tier = Math.floor(Math.random()*Math.min(3,1+Math.floor(waveNum/4)));
+  const tiers = [
+    { r:14, hp:2, speed:1.2, beer:'#f5c518', foam:'#fde8cc', pts:10 }, // светлое (как иконка)
+    { r:19, hp:4, speed:0.9, beer:'#7a2800', foam:'#f5ccaa', pts:25 }, // тёмное
+    { r:26, hp:8, speed:0.6, beer:'#1a0055', foam:'#d0b8ff', pts:50 }, // чёрное/артовое
+  ];
+  const t = tiers[tier];
+  monsters.push({
+    x, y, r:t.r, hp:t.hp, maxHp:t.hp,
+    speed: t.speed + waveNum*0.04,
+    beer: t.beer, foam: t.foam, pts: t.pts,
+    angle: 0,
+    wobble: Math.random()*Math.PI*2,
+    hitFlash: 0,
+    // Для навигации вокруг знака
+    waypoint: null,
+  });
+}
+
+// ── Навигация монстра ─────────────────────────────────────────────────────
+// Возвращает лучший угол движения: либо прямо к игроку, либо к ближайшему
+// углу знака, если прямой путь заблокирован.
+function monsterSteer(m) {
+  const tx = player.x, ty = player.y;
+  const dx = tx-m.x, dy = ty-m.y;
+
+  // Прямой путь свободен?
+  if (!segmentHitsSign(m.x, m.y, tx, ty)) {
+    m.waypoint = null;
+    return Math.atan2(dy, dx);
+  }
+
+  // Идём к вейпоинту если уже выбрали
+  if (m.waypoint !== null) {
+    const c = CORNERS[m.waypoint];
+    const wdx = c.x-m.x, wdy = c.y-m.y;
+    const wdist = Math.sqrt(wdx*wdx+wdy*wdy);
+    // Достигли вейпоинта — сбрасываем
+    if (wdist < 10) { m.waypoint = null; return Math.atan2(dy,dx); }
+    // Путь от вейпоинта к игроку теперь свободен — идём напрямую
+    if (!segmentHitsSign(c.x, c.y, tx, ty)) {
+      // продолжаем к вейпоинту пока не дойдём
+    }
+    return Math.atan2(wdy, wdx);
+  }
+
+  // Выбираем лучший угол-вейпоинт: минимальная суммарная длина обхода
+  let bestIdx = 0, bestCost = Infinity;
+  for (let i=0; i<CORNERS.length; i++) {
+    const c = CORNERS[i];
+    const d1 = Math.hypot(c.x-m.x, c.y-m.y);
+    const d2 = Math.hypot(tx-c.x, ty-c.y);
+    // штрафуем вейпоинты по ту же сторону от знака что и цель
+    if (d1+d2 < bestCost) { bestCost=d1+d2; bestIdx=i; }
+  }
+  m.waypoint = bestIdx;
+  const c = CORNERS[bestIdx];
+  return Math.atan2(c.y-m.y, c.x-m.x);
+}
+
+// ── UPDATE ────────────────────────────────────────────────────────────────
+function update() {
+  if (gameOver) return;
+
+  // Прицел по мыши
+  player.aimAngle = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+
+  // Движение стрелками или WASD
+  let dx=0, dy=0;
+  if (keys['ArrowLeft']  || keys['KeyA']) dx -= 1;
+  if (keys['ArrowRight'] || keys['KeyD']) dx += 1;
+  if (keys['ArrowUp']    || keys['KeyW']) dy -= 1;
+  if (keys['ArrowDown']  || keys['KeyS']) dy += 1;
+
+  if (dx !== 0 || dy !== 0) {
+    const len = Math.sqrt(dx*dx+dy*dy);
+    player.moveAngle = Math.atan2(dy, dx);
+    player.walkCycle += 0.18;
+    let tx = player.x + (dx/len)*PLAYER_SPEED;
+    let ty = player.y + (dy/len)*PLAYER_SPEED;
+    tx = Math.max(player.r, Math.min(W-player.r, tx));
+    ty = Math.max(player.r, Math.min(H-player.r, ty));
+    if (!circleRect(tx, ty, player.r, SIGN.x, SIGN.y, SIGN.w, SIGN.h)) {
+      player.x = tx; player.y = ty;
+    }
+  }
+
+  if (player.shootCd > 0) player.shootCd--;
+  if (mouse.down || keys['Space']) shoot();
+  if (player.invincible > 0) player.invincible--;
+  if (flashTimer > 0) flashTimer--;
+
+  // Пули
+  bullets = bullets.filter(b => {
+    b.x += b.vx; b.y += b.vy; b.life--;
+    if (b.life<=0 || b.x<0 || b.x>W || b.y<0 || b.y>H) return false;
+    if (circleRect(b.x,b.y,4,SIGN.x,SIGN.y,SIGN.w,SIGN.h)) {
+      signSpark(b.x,b.y,b.color); return false;
+    }
+    return true;
+  });
+
+  // Спавн
+  spawnTimer++;
+  if (spawnTimer >= spawnInterval) {
+    spawnTimer = 0;
+    const n = Math.min(1+Math.floor(waveNum/2), 6);
+    for (let i=0;i<n;i++) spawnMonster();
+    waveNum++;
+    spawnInterval = Math.max(45, spawnInterval-3);
+    elWave.textContent = waveNum;
+  }
+
+  // Монстры
+  monsters = monsters.filter(m => {
+    m.wobble += 0.07;
+    if (m.hitFlash > 0) m.hitFlash--;
+
+    const steerAngle = monsterSteer(m);
+    m.angle = steerAngle;
+    const tx = m.x + Math.cos(steerAngle)*m.speed;
+    const ty = m.y + Math.sin(steerAngle)*m.speed;
+    if (!circleRect(tx, ty, m.r, SIGN.x, SIGN.y, SIGN.w, SIGN.h)) {
+      m.x = Math.max(m.r, Math.min(W-m.r, tx));
+      m.y = Math.max(m.r, Math.min(H-m.r, ty));
+    }
+
+    // Пуля попала
+    for (let i=bullets.length-1;i>=0;i--) {
+      const b=bullets[i];
+      if (circleCircle(m.x,m.y,m.r,b.x,b.y,4)) {
+        m.hp--; m.hitFlash=8;
+        addHitSplash(b.x,b.y);
+        bullets.splice(i,1);
+        if (m.hp<=0) {
+          kills++; score+=m.pts;
+          addFoam(m.x,m.y,14);
+          updateHUD();
+          return false;
+        }
+      }
+    }
+
+    // Урон игроку
+    if (player.invincible===0 && circleCircle(player.x,player.y,player.r-4,m.x,m.y,m.r)) {
+      player.hp -= 8;
+      player.invincible = 40;
+      flashTimer = 14;
+      updateHUD();
+      if (player.hp<=0) gameOver=true;
+    }
+    return true;
+  });
+
+  particles = particles.filter(p => {
+    p.x+=p.vx; p.y+=p.vy;
+    p.vx*=.88; p.vy*=.88;
+    p.life--; return p.life>0;
+  });
+  casings = casings.filter(c => {
+    c.x+=c.vx; c.y+=c.vy;
+    c.vx*=.85; c.vy*=.85;
+    c.angle+=c.spin; c.life--;
+    c.alpha=c.life/50;
+    return c.life>0;
+  });
+}
+
+// ── РИСОВАНИЕ ─────────────────────────────────────────────────────────────
+function drawFloor() {
+  ctx.fillStyle='#2e2a26';
+  ctx.fillRect(0,0,W,H);
+  const tw=48,th=36;
+  ctx.lineWidth=1;
+  const shades=['#2e2a26','#2c2824','#302c28','#2a2622','#312d29'];
+  for (let row=0; row*th<H; row++) {
+    const off=(row%2)*(tw/2);
+    for (let col=-1; col*tw<W+tw; col++) {
+      ctx.fillStyle=shades[Math.abs(col+row*3)%5];
+      ctx.fillRect(col*tw+off+1, row*th+1, tw-2, th-2);
+      ctx.strokeStyle='#232120';
+      ctx.strokeRect(col*tw+off, row*th, tw, th);
+    }
+  }
+}
+
+function drawSign() {
+  ctx.fillStyle='rgba(0,0,0,0.55)';
+  ctx.fillRect(SIGN.x+6,SIGN.y+6,SIGN.w,SIGN.h);
+
+  const grd=ctx.createLinearGradient(SIGN.x,SIGN.y,SIGN.x,SIGN.y+SIGN.h);
+  grd.addColorStop(0,'#aaa'); grd.addColorStop(.45,'#eee'); grd.addColorStop(1,'#777');
+  ctx.fillStyle=grd;
+  ctx.fillRect(SIGN.x,SIGN.y,SIGN.w,SIGN.h);
+
+  ctx.fillStyle='#888';
+  [[8,8],[SIGN.w-8,8],[8,SIGN.h-8],[SIGN.w-8,SIGN.h-8]].forEach(([rx,ry])=>{
+    ctx.beginPath(); ctx.arc(SIGN.x+rx,SIGN.y+ry,4,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#666'; ctx.lineWidth=1; ctx.stroke();
+  });
+
+  ctx.strokeStyle='#999'; ctx.lineWidth=3;
+  ctx.strokeRect(SIGN.x,SIGN.y,SIGN.w,SIGN.h);
+
+  ctx.fillStyle='#111';
+  ctx.font='bold 36px "Courier New",monospace';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('SZCZECIN', SIGN.x+SIGN.w/2+1, SIGN.y+SIGN.h/2+1);
+  ctx.fillStyle='#1a1a1a';
+  ctx.fillText('SZCZECIN', SIGN.x+SIGN.w/2, SIGN.y+SIGN.h/2);
+
+  const pulse=.4+.3*Math.sin(Date.now()/400);
+  ctx.strokeStyle=`rgba(180,0,255,${pulse})`; ctx.lineWidth=3;
+  ctx.strokeRect(SIGN.x-3,SIGN.y-3,SIGN.w+6,SIGN.h+6);
+}
+
+function drawPlayer() {
+  const { x, y, aimAngle, moveAngle, hp, maxHp, invincible, walkCycle, shootCd, shootDelay } = player;
+  ctx.save();
+  ctx.translate(x, y);
+
+  // Тело вращается по направлению прицела
+  ctx.save();
+  ctx.rotate(aimAngle);
+
+  const flicker = invincible > 0 && Math.floor(invincible/4)%2;
+
+  // Пальто
+  ctx.fillStyle = flicker ? '#664422' : '#2a2a38';
+  ctx.fillRect(-13,-14,26,30);
+  ctx.fillStyle='#222232';
+  ctx.fillRect(-11,14,10,10);
+  ctx.fillRect(1,14,10,10);
+
+  // Жилет
+  ctx.fillStyle='#3a3a4a';
+  ctx.fillRect(-9,-10,18,20);
+
+  // Голова
+  ctx.fillStyle='#7a6050';
+  ctx.fillRect(-8,-24,16,14);
+
+  // Волосы
+  ctx.fillStyle='#3a2a1a';
+  ctx.fillRect(-8,-27,16,7);
+
+  // Очки-гоггли
+  ctx.fillStyle='#1166cc';
+  ctx.fillRect(-7,-22,5,6); ctx.fillRect(2,-22,5,6);
+  ctx.strokeStyle='#aaa'; ctx.lineWidth=1.5;
+  ctx.strokeRect(-7,-22,5,6); ctx.strokeRect(2,-22,5,6);
+  ctx.fillStyle='rgba(100,200,255,0.5)';
+  ctx.fillRect(-6,-21,3,4); ctx.fillRect(3,-21,3,4);
+
+  // Левый бластер (синий)
+  ctx.fillStyle='#445566';
+  ctx.fillRect(14,-8-22,20,7);
+  ctx.fillRect(30,-8-23,7,9);
+  if (shootCd > shootDelay*0.4) {
+    ctx.shadowBlur=14; ctx.shadowColor='#0088ff';
+    ctx.fillStyle='#44aaff';
+    ctx.fillRect(34,-8-22,5,7);
+    ctx.shadowBlur=0;
+  }
+
+  // Правый бластер (оранжевый)
+  ctx.fillStyle='#554433';
+  ctx.fillRect(14, 8+15,20,7);
+  ctx.fillRect(30, 8+14,7,9);
+  if (shootCd > shootDelay*0.4) {
+    ctx.shadowBlur=14; ctx.shadowColor='#ff6600';
+    ctx.fillStyle='#ffaa22';
+    ctx.fillRect(34, 8+15,5,7);
+    ctx.shadowBlur=0;
+  }
+
+  ctx.restore(); // конец rotate(aimAngle)
+
+  // HP-бар
+  const bw=40,bh=5,bx=x-bw/2-x,by=-32;
+  ctx.fillStyle='#330000'; ctx.fillRect(bx,by,bw,bh);
+  ctx.fillStyle=hp>60?'#44ff44':hp>30?'#ffaa00':'#ff2222';
+  ctx.fillRect(bx,by,bw*(hp/maxHp),bh);
+
+  ctx.restore();
+
+  // Прицел
+  ctx.save();
+  ctx.strokeStyle='rgba(255,80,80,0.7)'; ctx.lineWidth=1.5;
+  const cx=mouse.x, cy=mouse.y;
+  const cr=10;
+  ctx.beginPath(); ctx.arc(cx,cy,cr,0,Math.PI*2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx-cr-4,cy); ctx.lineTo(cx+cr+4,cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx,cy-cr-4); ctx.lineTo(cx,cy+cr+4); ctx.stroke();
+  ctx.restore();
+}
+
+// Рисуем кружку пива по иконке (фронтальный вид, масштаб s)
+function drawBeerMug(s, flash, beerColor, foamColor) {
+  // Координаты в локальном пространстве, центр — середина кружки
+  // Кружка ~40x50 у.е., s — масштаб
+  const lw = 2.8 * s; // толщина контура
+
+  // ── Тень ─────────────────────────────────────────────────────────────
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(2*s, 22*s, 18*s, 5*s, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // ── Ручка (за кружкой) ────────────────────────────────────────────────
+  // Внешний контур ручки
+  ctx.strokeStyle = flash ? '#fff' : '#111';
+  ctx.lineWidth = 9*s;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(17*s, 2*s, 10*s, -Math.PI*0.75, Math.PI*0.75);
+  ctx.stroke();
+  // Заливка ручки (голубоватая)
+  ctx.strokeStyle = flash ? '#ddf' : '#a0e8e8';
+  ctx.lineWidth = 5*s;
+  ctx.beginPath();
+  ctx.arc(17*s, 2*s, 10*s, -Math.PI*0.75, Math.PI*0.75);
+  ctx.stroke();
+  // Внутренняя линия ручки
+  ctx.strokeStyle = flash ? '#fff' : '#111';
+  ctx.lineWidth = lw*0.7;
+  ctx.beginPath();
+  ctx.arc(17*s, 2*s, 10*s, -Math.PI*0.75, Math.PI*0.75);
+  ctx.stroke();
+
+  // ── Тело кружки ──────────────────────────────────────────────────────
+  // Форма: верх прямой, бока прямые, низ скруглён
+  function mugBody(ox, oy, w, h, br) {
+    ctx.beginPath();
+    ctx.moveTo(ox + br,          oy);
+    ctx.lineTo(ox + w - br,     oy);
+    ctx.quadraticCurveTo(ox+w,  oy,    ox+w,  oy+br);
+    ctx.lineTo(ox+w,  oy+h-br);
+    ctx.quadraticCurveTo(ox+w,  oy+h,  ox+w-br, oy+h);
+    ctx.lineTo(ox+br,            oy+h);
+    ctx.quadraticCurveTo(ox,    oy+h,  ox,    oy+h-br);
+    ctx.lineTo(ox,   oy+br);
+    ctx.quadraticCurveTo(ox,    oy,    ox+br, oy);
+    ctx.closePath();
+  }
+
+  const bx=-14*s, by=-18*s, bw=28*s, bh=38*s, br=5*s;
+
+  // Заливка (пиво)
+  mugBody(bx,by,bw,bh,br);
+  ctx.fillStyle = flash ? '#ffe' : beerColor;
+  ctx.fill();
+
+  // Голубое дно
+  mugBody(bx, by+bh*0.75, bw, bh*0.25, br);
+  ctx.fillStyle = flash ? '#cef' : 'rgba(100,220,210,0.55)';
+  ctx.fill();
+
+  // Блик-полоса (левая)
+  ctx.save();
+  ctx.beginPath(); mugBody(bx,by,bw,bh,br); ctx.clip();
+  ctx.fillStyle = flash ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.38)';
+  ctx.fillRect(bx+2*s, by+2*s, 5*s, bh-6*s);
+  // Вертикальные полоски (стиль иконки)
+  ctx.fillStyle = flash ? 'rgba(255,255,255,0.3)' : 'rgba(0,0,0,0.08)';
+  ctx.fillRect(bx+10*s, by+8*s, 2.5*s, bh-14*s);
+  ctx.fillRect(bx+16*s, by+6*s, 2.5*s, bh-12*s);
+  ctx.restore();
+
+  // Контур кружки
+  mugBody(bx,by,bw,bh,br);
+  ctx.strokeStyle = flash ? '#fff' : '#111';
+  ctx.lineWidth = lw;
+  ctx.stroke();
+
+  // ── Пена сверху (как на иконке — облако пузырей) ─────────────────────
+  const foamY = by - 2*s;
+  const fc = flash ? '#fff' : foamColor;
+
+  // Заливка пены — несколько перекрывающихся окружностей
+  ctx.fillStyle = fc;
+  const foamBalls = [
+    [-9*s, foamY,        8*s],
+    [-2*s, foamY-5*s,    9*s],
+    [ 6*s, foamY-2*s,    8*s],
+    [13*s, foamY,        6*s],
+    [-13*s,foamY+2*s,    6*s],
+    [ 3*s, foamY-11*s,   6*s],
+    [-5*s, foamY-8*s,    5.5*s],
+  ];
+  foamBalls.forEach(([fx,fy,fr]) => {
+    ctx.beginPath(); ctx.arc(fx,fy,fr,0,Math.PI*2); ctx.fill();
+  });
+
+  // Кремовая заливка под пеной (закрыть верх кружки)
+  ctx.fillStyle = flash ? '#ffe' : '#fde8cc';
+  ctx.fillRect(bx+lw, by, bw-lw*2, 10*s);
+
+  // Контур каждого пузыря пены
+  ctx.strokeStyle = flash ? '#fff' : '#111';
+  ctx.lineWidth = lw * 0.85;
+  foamBalls.forEach(([fx,fy,fr]) => {
+    ctx.beginPath(); ctx.arc(fx,fy,fr,0,Math.PI*2); ctx.stroke();
+  });
+
+  // Блик на пене
+  ctx.fillStyle = 'rgba(255,255,255,0.45)';
+  ctx.beginPath(); ctx.arc(-3*s, foamY-6*s, 3*s, 0, Math.PI*2); ctx.fill();
+}
+
+function drawMonster(m) {
+  ctx.save();
+  ctx.translate(m.x, m.y);
+
+  // Кружка поворачивается в сторону движения (слегка)
+  ctx.rotate(m.angle - Math.PI/2);
+
+  const bob = Math.sin(m.wobble) * 1.8;
+  ctx.translate(0, bob);
+
+  const s = m.r / 14; // масштаб из радиуса
+  drawBeerMug(s, m.hitFlash > 0, m.beer, m.foam);
+
+  ctx.restore();
+
+  // HP-бар для крупных
+  if (m.maxHp >= 4) {
+    const bw = m.r*3;
+    ctx.fillStyle='#000'; ctx.fillRect(m.x-bw/2, m.y-m.r-14, bw, 5);
+    ctx.fillStyle=m.maxHp>=8?'#cc00ff':'#ff6600';
+    ctx.fillRect(m.x-bw/2, m.y-m.r-14, bw*(m.hp/m.maxHp), 5);
+  }
+}
+
+function drawBullet(b) {
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.rotate(Math.atan2(b.vy, b.vx));
+  ctx.shadowBlur=14; ctx.shadowColor=b.glow;
+  ctx.fillStyle=b.color;
+  ctx.fillRect(-10,-3,18,6);
+  ctx.fillStyle='#fff';
+  ctx.fillRect(6,-2,5,4);
+  ctx.shadowBlur=0;
+  ctx.restore();
+}
+
+function drawParticles() {
+  particles.forEach(p=>{
+    ctx.globalAlpha=p.life/p.maxLife;
+    ctx.fillStyle=p.color;
+    ctx.fillRect(p.x-p.size/2, p.y-p.size/2, p.size, p.size);
+  });
+  ctx.globalAlpha=1;
+}
+
+function drawCasings() {
+  casings.forEach(c=>{
+    ctx.save();
+    ctx.globalAlpha=c.alpha*0.75;
+    ctx.translate(c.x,c.y); ctx.rotate(c.angle);
+    ctx.fillStyle='#cc9900';
+    ctx.fillRect(-4,-2,8,4);
+    ctx.restore();
+  });
+  ctx.globalAlpha=1;
+}
+
+function drawGameOver() {
+  ctx.fillStyle='rgba(0,0,0,0.78)';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.shadowBlur=30; ctx.shadowColor='#ff2200';
+  ctx.fillStyle='#ff4422';
+  ctx.font='bold 72px "Courier New"';
+  ctx.fillText('GAME OVER', W/2, H/2-60);
+  ctx.shadowBlur=0;
+  ctx.fillStyle='#fff';
+  ctx.font='32px "Courier New"';
+  ctx.fillText(`SCORE: ${score}`, W/2, H/2);
+  ctx.fillText(`KILLS: ${kills}   WAVE: ${waveNum}`, W/2, H/2+50);
+  ctx.fillStyle='#aaddff';
+  ctx.font='22px "Courier New"';
+  ctx.fillText('[ R ] RESTART', W/2, H/2+120);
+}
+
+// ── LOOP ──────────────────────────────────────────────────────────────────
+function loop() {
+  update();
+  ctx.clearRect(0,0,W,H);
+  drawFloor();
+  drawCasings();
+  drawParticles();
+  drawSign();
+  monsters.forEach(drawMonster);
+  bullets.forEach(drawBullet);
+  drawPlayer();
+  if (flashTimer>0) {
+    ctx.fillStyle=`rgba(255,0,0,${flashTimer/28})`;
+    ctx.fillRect(0,0,W,H);
+  }
+  if (gameOver) drawGameOver();
+  requestAnimationFrame(loop);
+}
+
+init();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
